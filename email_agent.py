@@ -30,7 +30,7 @@ from googleapiclient.discovery import build
 from google import genai
 
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.send",
 ]
 MODEL = "gemini-2.5-flash"
@@ -148,7 +148,22 @@ def send_reply(service, email_data, reply_text):
     return sent
 
 
-def draft_reply(email):
+def mark_as_read(service, email_id):
+    """
+    Removes the UNREAD label so this email won't be re-fetched and
+    re-processed on the next run. Called either after a reply is sent,
+    or when the agent judges no reply is needed -- but NOT when the
+    user explicitly skips a needs-reply email, since that should stay
+    pending for a future run.
+    """
+    service.users().messages().modify(
+        userId="me",
+        id=email_id,
+        body={"removeLabelIds": ["UNREAD"]},
+    ).execute()
+
+
+def draft_reply(email, max_retries=3):
     """
     This is the actual 'thinking' step -- the LLM reads the email and
     decides what a good reply looks like. No tool involved here, this
@@ -156,7 +171,14 @@ def draft_reply(email):
 
     Returns a dict: {"needs_reply": bool, "reply_text": str}
     so the main loop can decide what to do without re-parsing prose.
+
+    Includes basic retry/backoff: free-tier APIs have rate limits, and
+    a real agent should handle that gracefully rather than crash --
+    this matters in production too, not just while testing.
     """
+    import time
+    import json
+
     prompt = f"""You are helping draft an email reply. Here is the email:
 
 From: {email['from']}
@@ -171,17 +193,27 @@ doesn't need one (e.g. LinkedIn activity updates, newsletters, automated alerts)
 Respond ONLY in this exact JSON format, nothing else, no markdown fences:
 {{"needs_reply": true or false, "reply_text": "the drafted reply, or empty string if no reply needed"}}
 """
-    response = gemini_client.models.generate_content(model=MODEL, contents=prompt)
-    text = response.text.strip()
-    # Strip markdown fences if the model adds them despite instructions
-    text = text.replace("```json", "").replace("```", "").strip()
 
-    import json
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: treat as no reply needed rather than crashing the loop
-        return {"needs_reply": False, "reply_text": ""}
+    for attempt in range(max_retries):
+        try:
+            response = gemini_client.models.generate_content(model=MODEL, contents=prompt)
+            text = response.text.strip()
+            text = text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Model didn't return clean JSON -- treat as no reply needed
+            return {"needs_reply": False, "reply_text": ""}
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 5 * (attempt + 1)  # simple backoff: 5s, 10s, 15s
+                print(f"[Rate limited -- waiting {wait}s before retry {attempt + 1}/{max_retries}]")
+                time.sleep(wait)
+            else:
+                raise  # not a rate-limit issue, don't hide other errors
+
+    # All retries exhausted -- skip this email rather than crash the whole run
+    print("[Gave up on this email after repeated rate-limit errors -- skipping]")
+    return {"needs_reply": False, "reply_text": ""}
 
 
 if __name__ == "__main__":
@@ -201,6 +233,7 @@ if __name__ == "__main__":
 
             if not result["needs_reply"]:
                 print("[Agent]: No reply needed -- looks like a notification/newsletter.")
+                mark_as_read(service, email["id"])
                 print()
                 continue
 
@@ -213,7 +246,10 @@ if __name__ == "__main__":
             choice = input("Send this reply? (y/n): ").strip().lower()
             if choice == "y":
                 send_reply(service, email, result["reply_text"])
+                mark_as_read(service, email["id"])
                 print("[Sent]")
             else:
-                print("[Skipped -- not sent]")
+                # Left unread on purpose -- you chose not to act on this
+                # one yet, so it should come up again on the next run.
+                print("[Skipped -- not sent, left unread for next time]")
             print()
