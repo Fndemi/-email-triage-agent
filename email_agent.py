@@ -163,6 +163,33 @@ def mark_as_read(service, email_id):
     ).execute()
 
 
+def send_notification(message_text):
+    """
+    Pings a Telegram chat -- a real notification channel separate from
+    terminal output, so you'd know a draft is ready even if you're not
+    watching the script run.
+
+    Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment
+    variables. Fails silently (prints a warning) rather than crashing
+    the whole agent if Telegram is unreachable -- a notification
+    failing shouldn't take down the core email-handling logic.
+    """
+    import requests
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        print("[Notification skipped -- TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set]")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": chat_id, "text": message_text}, timeout=10)
+    except Exception as e:
+        print(f"[Notification failed -- {e}]")
+
+
 def draft_reply(email, max_retries=3):
     """
     This is the actual 'thinking' step -- the LLM reads the email and
@@ -204,12 +231,15 @@ Respond ONLY in this exact JSON format, nothing else, no markdown fences:
             # Model didn't return clean JSON -- treat as no reply needed
             return {"needs_reply": False, "reply_text": ""}
         except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            is_rate_limit = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+            is_overloaded = "503" in str(e) or "UNAVAILABLE" in str(e)
+            if is_rate_limit or is_overloaded:
                 wait = 5 * (attempt + 1)  # simple backoff: 5s, 10s, 15s
-                print(f"[Rate limited -- waiting {wait}s before retry {attempt + 1}/{max_retries}]")
+                reason = "Rate limited" if is_rate_limit else "Server overloaded"
+                print(f"[{reason} -- waiting {wait}s before retry {attempt + 1}/{max_retries}]")
                 time.sleep(wait)
             else:
-                raise  # not a rate-limit issue, don't hide other errors
+                raise  # not a known transient issue, don't hide other errors
 
     # All retries exhausted -- skip this email rather than crash the whole run
     print("[Gave up on this email after repeated rate-limit errors -- skipping]")
@@ -239,6 +269,13 @@ if __name__ == "__main__":
 
             print(f"[Agent's draft reply]:\n{result['reply_text']}")
             print()
+
+            send_notification(
+                f"📧 Draft reply ready for: {email['subject']}\n"
+                f"From: {email['from']}\n\n"
+                f"Draft:\n{result['reply_text']}\n\n"
+                f"Go to your terminal to approve or skip."
+            )
 
             # --- Manual approval gate ---
             # The LLM only ever WRITES the reply. Sending is a real action
